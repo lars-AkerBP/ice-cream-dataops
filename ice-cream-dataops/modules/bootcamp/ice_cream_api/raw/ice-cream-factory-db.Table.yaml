@@ -1,0 +1,3 @@
+- dbName: ice-cream-factory-db
+  tableName: assets
+#  externalId: {{ icapi_extractors_source_id }}
