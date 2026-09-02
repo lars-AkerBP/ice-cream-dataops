@@ -6,7 +6,7 @@ from typing import Any, Dict
 from cognite.client import CogniteClient
 from cognite.client.data_classes.data_modeling import NodeId, ViewId
 from cognite.client.data_classes.data_modeling.cdm.v1 import CogniteAsset, CogniteTimeSeries, CogniteTimeSeriesApply
-from cognite.client.data_classes.filters import Prefix, ContainsAny
+from cognite.client.data_classes.filters import ContainsAny
 from cognite.client.exceptions import CogniteNotFoundError
 
 import numpy as np
@@ -21,32 +21,37 @@ def batcher(iterable, batch_size):
         yield batch
 
 
-def get_time_series_for_site(client: CogniteClient, site, space):
+def get_time_series_for_site(client: CogniteClient, site, space, assets):
     this_site = site.lower()
-    sub_tree_root = client.data_modeling.instances.retrieve_nodes(
-        NodeId(space, this_site),
-        node_cls=CogniteAsset
-    )
+    sub_tree_root_id = NodeId(space, this_site)
+    assets_by_id = {(asset.space, asset.external_id): asset for asset in assets}
 
-    if not sub_tree_root:
+    if (sub_tree_root_id.space, sub_tree_root_id.external_id) not in assets_by_id:
         print(
             f"----No CogniteAssets in CDF for {site}!----\n"
             f"    Run the 'Create Cognite Asset Hierarchy' transformation!"
         )
-        return
+        return []
 
-    sub_tree_nodes = client.data_modeling.instances.list(
-        instance_type=CogniteAsset,
-        filter=Prefix(property=["cdf_cdm", "CogniteAsset/v1", "path"], value=sub_tree_root.path),
-        limit=None
-    )
+    children_by_parent = {}
+    for asset in assets:
+        if asset.parent:
+            parent_id = (asset.parent.space, asset.parent.external_id)
+            children_by_parent.setdefault(parent_id, []).append((asset.space, asset.external_id))
+
+    sub_tree_nodes = []
+    pending = [(sub_tree_root_id.space, sub_tree_root_id.external_id)]
+    while pending:
+        node_id = pending.pop()
+        sub_tree_nodes.append(assets_by_id[node_id])
+        pending.extend(children_by_parent.get(node_id, []))
 
     if not sub_tree_nodes:
         print(
             f"----No CogniteTimeSeries in CDF for {site}!----\n"
             f"    Run the 'Contextualize Timeseries and Assets' transformation!"
         )
-        return
+        return []
 
     value_list = [{"space": node.space, "externalId": node.external_id} for node in sub_tree_nodes]
 
@@ -94,15 +99,22 @@ def handle(client: CogniteClient, data: Dict[str, Any] = {}) -> None:
     sites = sites or all_sites
 
     print(f"Processing datapoints for these sites: {sites}")
+    assets = client.data_modeling.instances.list(
+        instance_type=CogniteAsset,
+        space="icapi_dm_space",
+        limit=None
+    )
     with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(process_site, client, lookback_minutes, site) for site in sites]
+        futures = [executor.submit(process_site, client, lookback_minutes, site, assets) for site in sites]
         for f in futures:
             f.result()
 
-def process_site(client, lookback_minutes, site):
+def process_site(client, lookback_minutes, site, assets):
     oee_space = "oee_ts_space"
     source_space = "icapi_dm_space"
-    timeseries = get_time_series_for_site(client, site, source_space)
+    timeseries = get_time_series_for_site(client, site, source_space, assets)
+    if not timeseries:
+        return
     # Debug:
     # print(f"Retrieved {len(timeseries)} time series for site {site}")
     asset_eids = list(set([item.external_id.split(sep=":")[0] for item in timeseries]))

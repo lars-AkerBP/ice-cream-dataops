@@ -6,7 +6,7 @@ from cognite.client import CogniteClient
 from cognite.client.data_classes import ExtractionPipelineRun
 from cognite.client.data_classes.data_modeling import NodeId, ViewId
 from cognite.client.data_classes.data_modeling.cdm.v1 import CogniteAsset, CogniteTimeSeries
-from cognite.client.data_classes.filters import Prefix, ContainsAny
+from cognite.client.data_classes.filters import ContainsAny
 
 from ice_cream_factory_api import IceCreamFactoryAPI
 
@@ -22,25 +22,30 @@ def batcher(iterable, batch_size):
         yield batch
 
 
-def get_time_series_for_site(client: CogniteClient, site):
+def get_time_series_for_site(client: CogniteClient, site, assets):
     this_site = site.lower()
-    sub_tree_root = client.data_modeling.instances.retrieve_nodes(
-        NodeId("icapi_dm_space", this_site),
-        node_cls=CogniteAsset
-    )
+    sub_tree_root_id = NodeId("icapi_dm_space", this_site)
+    assets_by_id = {(asset.space, asset.external_id): asset for asset in assets}
 
-    if not sub_tree_root:
+    if (sub_tree_root_id.space, sub_tree_root_id.external_id) not in assets_by_id:
         print(
             f"----No CogniteAssets in CDF for {site}!----\n"
             f"    Run the 'Create Cognite Asset Hierarchy' transformation!"
         )
         return []
 
-    sub_tree_nodes = client.data_modeling.instances.list(
-        instance_type=CogniteAsset,
-        filter=Prefix(property=["cdf_cdm", "CogniteAsset/v1", "path"], value=sub_tree_root.path),
-        limit=None
-    )
+    children_by_parent = {}
+    for asset in assets:
+        if asset.parent:
+            parent_id = (asset.parent.space, asset.parent.external_id)
+            children_by_parent.setdefault(parent_id, []).append((asset.space, asset.external_id))
+
+    sub_tree_nodes = []
+    pending = [(sub_tree_root_id.space, sub_tree_root_id.external_id)]
+    while pending:
+        node_id = pending.pop()
+        sub_tree_nodes.append(assets_by_id[node_id])
+        pending.extend(children_by_parent.get(node_id, []))
 
     if not sub_tree_nodes:
         print(
@@ -124,11 +129,17 @@ def handle(client: CogniteClient = None, data=None):
     ice_cream_api = IceCreamFactoryAPI(base_url="https://ice-cream-factory.inso-internal.cognite.ai")
 
     try:
+        assets = client.data_modeling.instances.list(
+            instance_type=CogniteAsset,
+            space="icapi_dm_space",
+            limit=None
+        )
+
         for site in sites:
             print(f"Getting Data Points for {site}")
             big_start = default_timer()
 
-            time_series = get_time_series_for_site(client, site)
+            time_series = get_time_series_for_site(client, site, assets)
 
             latest_dps = {
                 dp.external_id: dp.timestamp
@@ -165,4 +176,4 @@ def handle(client: CogniteClient = None, data=None):
 
         report_ext_pipe(client, "success")
     except Exception as e:
-        report_ext_pipe(client, "fail", e)
+        report_ext_pipe(client, "fail", str(e))
